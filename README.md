@@ -2,6 +2,8 @@
 
 Production-grade backend proof-of-work implementing **AlphaGeometry-style neuro-symbolic verification** (OR-Tools CP-SAT + tool-mediated grounded LLM recovery) and **zero-blast-radius incremental re-planning** for multi-city travel itineraries.
 
+**Live Interactive Swagger API:** https://tripgraph-engine.onrender.com/docs *(Render Free tier — allow ~30s cold start on first request)*
+
 ## Measured Results (116 Held-Out Scenarios × 10 Repeats)
 
 Full reproducible metrics and two-stage scenario-clustered bootstrap 95% CIs live in [`BENCHMARK_RESULTS.md`](./BENCHMARK_RESULTS.md).

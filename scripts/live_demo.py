@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date, time
 import json
 import sys
+import uuid
 
 import httpx
 
@@ -17,7 +18,7 @@ from tripgraph.schema.models import (
 )
 from tripgraph.time.tz_registry import PinnedTzRegistry, resolve_local_to_utc
 
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = sys.argv[1].rstrip("/") if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 D_SUN = date(2026, 6, 14)
 D_MON = date(2026, 6, 15)
 
@@ -28,7 +29,7 @@ def _tyo_utc(d: date, h: int, m: int = 0) -> int:
     return res.utc_epoch
 
 
-def build_demo_trip() -> TripGraph:
+def build_demo_trip(trip_id: str) -> TripGraph:
     stay = CityStay(
         id="s_tyo",
         city_id="tokyo",
@@ -65,28 +66,29 @@ def build_demo_trip() -> TripGraph:
             duration_min=120, category="contemporary_art", node_tier=NodeTier.OPTIONAL,
         ),
     )
-    return TripGraph(trip_id="demo_tokyo_v7", stays=(stay,), activities=acts)
+    return TripGraph(trip_id=trip_id, stays=(stay,), activities=acts)
 
 
 def main() -> None:
     try:
-        httpx.get(f"{BASE_URL}/health", timeout=2.0).raise_for_status()
+        httpx.get(f"{BASE_URL}/health", timeout=35.0).raise_for_status()
     except httpx.HTTPError:
         print("Server not running at http://127.0.0.1:8000. Start it with `make serve` first.")
         sys.exit(1)
 
-    trip = build_demo_trip()
+    tid = f"demo_tokyo_{uuid.uuid4().hex[:6]}"
+    trip = build_demo_trip(tid)
     print("\n=== 1. POST /trips (Tokyo trip with Monday-closed Mori Art Museum) ===")
     r1 = httpx.post(f"{BASE_URL}/trips", json=trip.model_dump(mode="json"))
     print(f"HTTP {r1.status_code}: {r1.json()}")
 
-    print("\n=== 2. POST /trips/demo_tokyo_v7/verify (K3 Verifier catches closure) ===")
-    r2 = httpx.post(f"{BASE_URL}/trips/demo_tokyo_v7/verify")
+    print(f"\n=== 2. POST /trips/{tid}/verify (K3 Verifier catches closure) ===")
+    r2 = httpx.post(f"{BASE_URL}/trips/{tid}/verify")
     print(f"HTTP {r2.status_code}: {json.dumps(r2.json(), indent=2)}")
 
-    print("\n=== 3. PATCH /trips/demo_tokyo_v7/edit (Subprocess CP-SAT + S2_taxonomy) ===")
+    print(f"\n=== 3. PATCH /trips/{tid}/edit (Subprocess CP-SAT + S2_taxonomy) ===")
     r3 = httpx.patch(
-        f"{BASE_URL}/trips/demo_tokyo_v7/edit",
+        f"{BASE_URL}/trips/{tid}/edit",
         json={
             "edit": {
                 "edit_type": "move_activity",
@@ -99,6 +101,9 @@ def main() -> None:
         timeout=10.0,
     )
     b3 = r3.json()
+    if r3.status_code != 200 or "graph" not in b3:
+        print(f"HTTP {r3.status_code}:", json.dumps(b3, indent=2))
+        sys.exit(1)
     swapped = next(a["place_id"] for a in b3["graph"]["activities"] if a["id"] == "a_mon_art")
     print(f"HTTP {r3.status_code} | version={b3['version']} | mode={b3['recovery_mode']}")
     print(f"  solver_certificate      : {b3['solver_certificate']}")
@@ -106,9 +111,9 @@ def main() -> None:
     print(f"  a_mon_art swapped to    : {swapped} (Sunday stayed SHA-256 frozen)")
     print(f"  blast_radius            : {b3['blast_radius']}")
 
-    print("\n=== 4. PATCH /trips/demo_tokyo_v7/edit (Shift +2 days -> >50% dirty -> 202 + SSE) ===")
+    print(f"\n=== 4. PATCH /trips/{tid}/edit (Shift +2 days -> >50% dirty -> 202 + SSE) ===")
     r4 = httpx.patch(
-        f"{BASE_URL}/trips/demo_tokyo_v7/edit",
+        f"{BASE_URL}/trips/{tid}/edit",
         json={"edit": {"edit_type": "shift_start_date", "delta_days": 2}},
         timeout=10.0,
     )
@@ -121,7 +126,7 @@ def main() -> None:
             if line:
                 print(" ", line)
 
-    r5 = httpx.get(f"{BASE_URL}/trips/demo_tokyo_v7")
+    r5 = httpx.get(f"{BASE_URL}/trips/{tid}")
     print(f"\nFinal committed trip version: {r5.json()['version']}")
 
 
