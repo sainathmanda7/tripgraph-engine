@@ -1,0 +1,9 @@
+{
+  "version": "tripgraph-v7-controls-1",
+  "taxonomy_and_weights_sha256": "8eb3318603656896cb62b3c5e3624bbcff09fa6f9be7b5d50d3825b2417968f8",
+  "retrieval_budget": {
+    "max_provider_queries": 1,
+    "max_candidates_fetched": 20,
+    "max_candidates_to_cpsat": 5
+  }
+}
