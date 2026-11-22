@@ -110,6 +110,7 @@ make docker-up
 | **[`docs/adr/`](./docs/adr/)** | 5 Architecture Decision Records covering [Dual-Model IR](./docs/adr/001-dual-model-cpsat-ir.md), [SIGKILL Subprocess Pool](./docs/adr/002-subprocess-solver-pool-sigkill.md), [Kleene K3 & Pinned TZDB](./docs/adr/003-kleene-k3-pareto-verification.md), [Dirty Closure & LockGuard](./docs/adr/004-factor-graph-dirty-closure-lockguard.md), and [Fenced SQLite Commits & Async 202](./docs/adr/005-sqlite-fenced-commits-async-replan.md). |
 | **[`docs/performance.md`](./docs/performance.md)** | Full benchmark dashboard (`p50`/`p95`/`p99`), incremental ablation profile, 85% coverage table across 2,922 statements, bottleneck analysis, and verified failure demos. |
 | **[`docs/api.md`](./docs/api.md)** | Full HTTP & SSE API specification, `200`/`202`/`409`/`503` contracts, and copy-paste `curl` commands. |
+| **[`docs/case-study.md`](./docs/case-study.md)** | 1-page executive technical case study covering problem framing, dual-model CP-SAT architecture, `5.36x` scaling results, and production trade-offs. |
 | **[`examples/`](./examples/)** | Engine-verified JSON itineraries (`valid_tokyo_trip.json`, `invalid_closed_monday.json`), sync edit payloads, and live `202 Accepted` + SSE transcript. |
 
 ---
