@@ -1,0 +1,12 @@
+{
+  "hard_constraints_status": "FALSE",
+  "verification_certificate": "VIOLATED_FALSE",
+  "violations": [
+    {
+      "check_id": "availability:a_mon_art",
+      "code": "CLOSED_BY_AUTHORITATIVE_SOURCE",
+      "detail": "Availability for Mori Art Museum: CLOSED_BY_AUTHORITATIVE_SOURCE"
+    }
+  ],
+  "assumptions_accepted": []
+}

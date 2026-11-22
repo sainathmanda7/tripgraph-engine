@@ -1,0 +1,11 @@
+{
+  "edit": {
+    "edit_type": "move_activity",
+    "activity_id": "a_mon_art",
+    "target_stay_id": "s_tyo",
+    "target_local_date": "2026-06-15",
+    "target_start_utc": 1781492400
+  },
+  "verification_policy": "ASSUME_WEEKLY_NON_HOLIDAY",
+  "allow_auto_drop_optional": false
+}

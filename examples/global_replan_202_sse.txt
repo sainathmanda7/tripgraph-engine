@@ -1,0 +1,20 @@
+# Request: PATCH /trips/example_tokyo_closed_mon/edit
+# Body:    {"edit": {"edit_type": "shift_start_date", "delta_days": 2}}
+
+# HTTP 202 Accepted:
+{
+  "mode": "GLOBAL_REPLAN_ESCALATED",
+  "reason": "DIRTY_RATIO_EXCEEDED:1.00>0.50",
+  "job_id": "job_743bcce6c676",
+  "events_url": "/jobs/job_743bcce6c676/events",
+  "dirty_ratio": 1.0
+}
+
+# Stream: GET /jobs/job_743bcce6c676/events (text/event-stream)
+data: {"stage": "global_replan_started", "reason": "DIRTY_RATIO_EXCEEDED:1.00>0.50"}
+
+data: {"stage": "compiling_global_ir", "days": 2}
+
+data: {"stage": "solving_global_cpsat"}
+
+data: {"stage": "completed", "version": 3}
