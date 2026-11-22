@@ -283,6 +283,7 @@ def run_deterministic_benchmark(
                         "llm_calls": row.llm_calls,
                         "total_tokens": row.total_tokens,
                         "median_ms": sorted(latencies)[len(latencies) // 2],
+                        "repeat_latencies_ms": [round(x, 3) for x in latencies],
                     }
                 )
             )
@@ -312,6 +313,7 @@ def run_deterministic_benchmark(
         p50 = scenario_clustered_quantile_ci(clusters, 0.50, n_boot=400)
         p90 = scenario_clustered_quantile_ci(clusters, 0.90, n_boot=400)
         p95 = scenario_clustered_quantile_ci(clusters, 0.95, n_boot=400)
+        p99 = scenario_clustered_quantile_ci(clusters, 0.99, n_boot=400)
 
         summary[arm] = {
             "n_scenarios": n,
@@ -324,6 +326,7 @@ def run_deterministic_benchmark(
             "p50_ms": p50,
             "p90_ms": p90,
             "p95_ms": p95,
+            "p99_ms": p99,
         }
 
     result_obj = {
@@ -367,19 +370,20 @@ def _write_markdown_report(res: dict) -> None:
         "",
         "## Deterministic Local Arms (0 LLM Tokens)",
         "",
-        "| Arm | Overall Accuracy | R1 Shiftable | R2A Closure | R2B Intent | R3 Hard-Lock Refusal | Blast Radius (Sem/Tmp) | p50 ms [95% CI] | p95 ms [95% CI] |",
-        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        "| Arm | Overall Accuracy | R1 Shiftable | R2A Closure | R2B Intent | R3 Hard-Lock Refusal | Blast Radius (Sem/Tmp) | p50 ms [95% CI] | p95 ms [95% CI] | p99 ms [95% CI] |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
     for arm, d in res["arms"].items():
         br = d["by_regime"]
-        p50, p95 = d["p50_ms"], d["p95_ms"]
+        p50, p95, p99 = d["p50_ms"], d["p95_ms"], d["p99_ms"]
         lines.append(
             f"| **`{arm}`** | **{d['overall_correct_rate']:.1%}** | "
             f"{br['R1_SHIFTABLE']:.1%} | {br['R2A_STRUCTURED_CLOSURE']:.1%} | "
             f"{br['R2B_FREETEXT_INTENT']:.1%} | {br['R3_HARD_LOCK_UNSAT']:.1%} | "
             f"{d['mean_semantic_blast_radius']:.1%} / {d['mean_temporal_blast_radius']:.1%} | "
             f"{p50.point:.1f} [{p50.ci_low:.1f}, {p50.ci_high:.1f}] | "
-            f"{p95.point:.1f} [{p95.ci_low:.1f}, {p95.ci_high:.1f}] |"
+            f"{p95.point:.1f} [{p95.ci_low:.1f}, {p95.ci_high:.1f}] | "
+            f"{p99.point:.1f} [{p99.ci_low:.1f}, {p99.ci_high:.1f}] |"
         )
 
     m1 = res["mcnemar"]["S2_taxonomy_vs_S2_greedy"]
@@ -416,7 +420,7 @@ def main() -> None:
     res = run_deterministic_benchmark(split=args.split, repeats=args.repeats, write_outputs=True)
     print(f"Benchmark complete ({args.split}). Wrote BENCHMARK_RESULTS.md & eval/per_scenario_metrics.jsonl.")
     for arm, d in res["arms"].items():
-        print(f"  {arm:12s} | acc={d['overall_correct_rate']:.1%} | p50={d['p50_ms'].point:.1f}ms | p95={d['p95_ms'].point:.1f}ms")
+        print(f"  {arm:12s} | acc={d['overall_correct_rate']:.1%} | p50={d['p50_ms'].point:.1f}ms | p95={d['p95_ms'].point:.1f}ms | p99={d['p99_ms'].point:.1f}ms")
 
 
 if __name__ == "__main__":
