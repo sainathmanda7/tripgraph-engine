@@ -128,6 +128,8 @@ def main(argv: list[str] | None = None) -> None:
                 req["ir"],
                 opt_timeout_sec=float(req.get("opt_timeout_sec", 0.75)),
                 diag_total_budget_ms=float(req.get("diag_total_budget_ms", 250.0)),
+                diag_initial_sec=float(req.get("diag_initial_sec", 0.070)),
+                mus_per_probe_sec=float(req.get("mus_per_probe_sec", 0.020)),
                 run_mus=bool(req.get("run_mus", True)),
                 opt_workers=int(req.get("opt_workers", 2)),
             )

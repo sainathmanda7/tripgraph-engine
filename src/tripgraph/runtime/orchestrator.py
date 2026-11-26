@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, time as dt_time, timedelta, timezone
 import time
@@ -329,6 +330,22 @@ class TripOrchestrator:
         self.jobs: dict[str, GlobalReplanJob] = {}
         self._bg_tasks: set[asyncio.Task] = set()
 
+        # Env-configurable solver budgets: local defaults stay tight (950/250/70/20ms);
+        # Render 0.1 vCPU containers (RENDER=true) get CFS-throttling headroom.
+        is_render = os.getenv("RENDER", "").lower() == "true"
+        self.opt_workers = int(os.getenv("TRIPGRAPH_OPT_WORKERS", "1" if is_render else "2"))
+        self.h0_cap_ms = float(os.getenv("TRIPGRAPH_H0_CAP_MS", "2500.0" if is_render else "950.0"))
+        self.tax_cap_ms = float(os.getenv("TRIPGRAPH_TAX_CAP_MS", "1800.0" if is_render else "650.0"))
+        self.diag_total_budget_ms = float(
+            os.getenv("TRIPGRAPH_DIAG_BUDGET_MS", "900.0" if is_render else "250.0")
+        )
+        self.diag_initial_sec = (
+            float(os.getenv("TRIPGRAPH_DIAG_INITIAL_MS", "350.0" if is_render else "70.0")) / 1000.0
+        )
+        self.mus_per_probe_sec = (
+            float(os.getenv("TRIPGRAPH_MUS_PROBE_MS", "120.0" if is_render else "20.0")) / 1000.0
+        )
+
     def verify_only(self, graph: TripGraph) -> VerificationReport:
         places = self.provider.all_places()
         holidays = {s.city_id: self.provider.get_public_holidays(s.city_id) for s in graph.stays}
@@ -516,13 +533,16 @@ class TripOrchestrator:
             )
 
             # 5. Dispatch Horizon 0 solve to isolated subprocess pool (NON-BLOCKING!)
-            h0_cap = ctx.stage_cap_sec(950.0)
+            h0_cap = ctx.stage_cap_sec(self.h0_cap_ms)
             solve_res = await self.supervisor.solve(
                 ir,
                 hard_deadline_sec=h0_cap,
-                opt_timeout_sec=min(0.75, max(0.05, h0_cap - 0.15)),
-                diag_total_budget_ms=250.0,
+                opt_timeout_sec=min(max(0.75, h0_cap * 0.55), max(0.05, h0_cap - 0.15)),
+                diag_total_budget_ms=self.diag_total_budget_ms,
+                diag_initial_sec=self.diag_initial_sec,
+                mus_per_probe_sec=self.mus_per_probe_sec,
                 run_mus=True,
+                opt_workers=self.opt_workers,
                 test_hang_sec=test_hang_sec,
             )
 
@@ -608,11 +628,13 @@ class TripOrchestrator:
                                     public_holidays_by_city=holidays,
                                     allow_auto_drop_optional=allow_auto_drop_optional,
                                 )
+                                tax_cap = ctx.stage_cap_sec(self.tax_cap_ms)
                                 tax_res = await self.supervisor.solve(
                                     ir_tax,
-                                    hard_deadline_sec=ctx.stage_cap_sec(650.0),
-                                    opt_timeout_sec=0.55,
+                                    hard_deadline_sec=tax_cap,
+                                    opt_timeout_sec=min(max(0.55, tax_cap - 0.10), max(0.05, tax_cap - 0.05)),
                                     run_mus=False,
+                                    opt_workers=self.opt_workers,
                                 )
                                 if tax_res.certificate in (
                                     "PROVEN_OPTIMAL_IN_SCOPE",
@@ -788,6 +810,7 @@ class TripOrchestrator:
                 hard_deadline_sec=5.5,
                 opt_timeout_sec=5.0,
                 run_mus=False,
+                opt_workers=self.opt_workers,
             )
             if res.certificate not in ("PROVEN_OPTIMAL_IN_SCOPE", "FEASIBLE_OPTIMALITY_UNPROVEN"):
                 self.store.abort_request(job.request_id)

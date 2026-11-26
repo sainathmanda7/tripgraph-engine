@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import os
 from typing import AsyncGenerator
 
 from fastapi import FastAPI, HTTPException
@@ -30,8 +31,11 @@ class EditRequestBody(BaseModel):
 def create_app(
     *,
     db_path: str = ":memory:",
-    max_solver_workers: int = 2,
+    max_solver_workers: int | None = None,
 ) -> FastAPI:
+    if max_solver_workers is None:
+        default_workers = 1 if os.getenv("RENDER", "").lower() == "true" else 2
+        max_solver_workers = int(os.getenv("TRIPGRAPH_MAX_WORKERS", str(default_workers)))
     store = FencedTripStore(db_path=db_path)
     supervisor = SolverProcessSupervisor(max_workers=max_solver_workers)
     provider = FixtureGroundingProvider()
