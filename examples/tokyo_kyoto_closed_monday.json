@@ -1,5 +1,5 @@
 {
-  "trip_id": "example_tokyo_closed_mon",
+  "trip_id": "example_tokyo_kyoto_closed_mon",
   "version": 1,
   "stays": [
     {
@@ -11,6 +11,47 @@
         "hotel_name": "Roppongi Central",
         "tz_iana": "Asia/Tokyo",
         "check_in_date": "2026-06-14",
+        "check_out_date": "2026-06-16",
+        "guarantee_type": "CARD_GUARANTEED",
+        "access_method": "STAFFED_24H",
+        "standard_checkin": {
+          "day_offset": 0,
+          "local_time": "15:00:00"
+        },
+        "standard_checkout": "11:00:00",
+        "no_show_cutoff": {
+          "day_offset": 1,
+          "local_time": "06:00:00"
+        },
+        "multi_night_preserve_on_noshow": false,
+        "late_notify_policy": {
+          "supported": false,
+          "notify_by": null,
+          "extended_hold_until": null
+        },
+        "guest_notified_late_at_utc": null,
+        "staffed_desk_cutoff": null,
+        "contactless_policy": null,
+        "baggage_drop_policy": {
+          "checkin_day_open": null,
+          "checkin_day_close": null,
+          "checkout_day_until": null
+        },
+        "date_policy_overrides": {}
+      },
+      "arrival_binding": "DIRECT_ROOM_CHECKIN",
+      "node_tier": "CRITICAL",
+      "locked_by_user": false
+    },
+    {
+      "id": "s_kyo",
+      "city_id": "kyoto",
+      "tz_iana": "Asia/Tokyo",
+      "hotel": {
+        "hotel_id": "h_kyo",
+        "hotel_name": "Gion Ryokan",
+        "tz_iana": "Asia/Tokyo",
+        "check_in_date": "2026-06-16",
         "check_out_date": "2026-06-18",
         "guarantee_type": "CARD_GUARANTEED",
         "access_method": "STAFFED_24H",
@@ -44,7 +85,23 @@
       "locked_by_user": false
     }
   ],
-  "transit_legs": [],
+  "transit_legs": [
+    {
+      "id": "leg_tyo_kyo",
+      "from_stay_id": "s_tyo",
+      "to_stay_id": "s_kyo",
+      "origin_place_id": "tyo_station",
+      "dest_place_id": "kyo_station",
+      "mode": "RAIL",
+      "depart_utc": 1781582400,
+      "arrive_utc": 1781590500,
+      "carrier_slot_id": "nozomi_215",
+      "boarding_buffer_min": 20,
+      "cost_usd": 95,
+      "node_tier": "CRITICAL",
+      "locked_by_user": false
+    }
+  ],
   "activities": [
     {
       "id": "a_sun_park",
@@ -105,6 +162,40 @@
       "local_date": "2026-06-15",
       "start_utc": 1781490600,
       "end_utc": 1781497800,
+      "duration_min": 120,
+      "is_milestone": false,
+      "is_meal": false,
+      "node_tier": "OPTIONAL",
+      "locked_by_user": false,
+      "cost_usd": 0,
+      "category": "contemporary_art",
+      "tags": []
+    },
+    {
+      "id": "a_tue_fushimi",
+      "stay_id": "s_kyo",
+      "city_id": "kyoto",
+      "place_id": "kyo_fushimi",
+      "local_date": "2026-06-16",
+      "start_utc": 1781595000,
+      "end_utc": 1781600400,
+      "duration_min": 90,
+      "is_milestone": false,
+      "is_meal": false,
+      "node_tier": "ESSENTIAL",
+      "locked_by_user": false,
+      "cost_usd": 0,
+      "category": "shrine",
+      "tags": []
+    },
+    {
+      "id": "a_wed_art",
+      "stay_id": "s_kyo",
+      "city_id": "kyoto",
+      "place_id": "kyo_kyocera_art",
+      "local_date": "2026-06-17",
+      "start_utc": 1781658000,
+      "end_utc": 1781665200,
       "duration_min": 120,
       "is_milestone": false,
       "is_meal": false,

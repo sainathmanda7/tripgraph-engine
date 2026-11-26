@@ -1,0 +1,9 @@
+{
+  "status": "LOCKED_NODE_CONFLICT",
+  "detail": "ShiftStartDateEdit refused because user-locked nodes exist. Pass allow_shift_locked=true to explicitly calendar-shift locked nodes.",
+  "locked_stays": [],
+  "locked_legs": [],
+  "locked_activities": [
+    "a_mon_shrine"
+  ]
+}

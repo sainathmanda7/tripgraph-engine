@@ -11,8 +11,8 @@ flowchart TB
     User["Traveler / Client App / Swagger UI"]
 
     subgraph System["TripGraph v7 Engine (Docker Container)"]
-        API["FastAPI HTTP + SSE Gateway<br/>(tripgraph.api.main)<br/>Zero in-process ortools (AST-guarded)"]
-        Orch["TripOrchestrator<br/>(tripgraph.runtime.orchestrator)<br/>8s Sync Deadline / 30s Async GlobalReplan"]
+        API["FastAPI HTTP + SSE Gateway<br/>(tripgraph.api.main)<br/>Zero ortools in sys.modules (Fresh-Process + AST Guarded)"]
+        Orch["TripOrchestrator<br/>(tripgraph.runtime.orchestrator)<br/>8s Sync / In-Memory Async GlobalReplan (LockGuard + K3 on ALL Paths)"]
         Ver["K3 Independent Verifier<br/>(tripgraph.verifier)<br/>Pareto Evidence + Hotel State Machine"]
         Sup["SolverProcessSupervisor<br/>(tripgraph.runtime.supervisor)<br/>Bounded Pool + Queue Admission"]
         Workers["Isolated OS Solver Workers<br/>(worker_main.py via pipes)<br/>OR-Tools CP-SAT + PR_SET_PDEATHSIG(SIGKILL)<br/>ZERO Database Credentials"]
@@ -201,9 +201,9 @@ flowchart TD
 
 ---
 
-## 6. Production Deployment Architecture
+## 6. Public Demo Deployment Architecture
 
-Runtime isolation topology running live at `https://tripgraph-engine.onrender.com`.
+Runtime isolation topology running on the public demo deployment at `https://tripgraph-engine.onrender.com` (seeded `FixtureGroundingProvider`, `:memory:` SQLite, in-memory `asyncio` global jobs).
 
 ```mermaid
 flowchart TB
@@ -214,8 +214,8 @@ flowchart TB
         SQLite[("SQLite DB (FencedTripStore)<br/>trips + edit_requests")]
 
         subgraph Pool["SolverProcessSupervisor (Bounded Pool)"]
-            W1["OS Worker Process 1<br/>start_new_session=True (Own PGID)<br/>Linux prctl(PR_SET_PDEATHSIG, SIGKILL)<br/>Native OR-Tools C++ CP-SAT"]
-            W2["OS Worker Process 2<br/>start_new_session=True (Own PGID)<br/>Linux prctl(PR_SET_PDEATHSIG, SIGKILL)<br/>Native OR-Tools C++ CP-SAT"]
+            W1["OS Worker Process 1<br/>start_new_session=True (Own PGID)<br/>prctl(PR_SET_PDEATHSIG) BEFORE ortools + ppid Check<br/>Native OR-Tools C++ CP-SAT"]
+            W2["OS Worker Process 2<br/>start_new_session=True (Own PGID)<br/>prctl(PR_SET_PDEATHSIG) BEFORE ortools + ppid Check<br/>Native OR-Tools C++ CP-SAT"]
         end
 
         Uvicorn <-->|"Thread-Safe Fenced SQL"| SQLite
