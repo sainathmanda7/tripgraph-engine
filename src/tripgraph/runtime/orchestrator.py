@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, time as dt_time, timedelta, timezone
 import time
 import uuid
 from typing import Any, Literal
@@ -25,6 +25,7 @@ from tripgraph.schema.edits import (
     DropActivityEdit,
     EditCommand,
     ExtendStayEdit,
+    LateNightArrivalEdit,
     MoveActivityEdit,
     ShiftStartDateEdit,
     SwapHotelEdit,
@@ -38,7 +39,7 @@ from tripgraph.schema.models import (
 )
 from tripgraph.solver.types import DualSolveResult
 from tripgraph.solver.ir import compile_dirty_ir, is_epistemic_allowed
-from tripgraph.time.tz_registry import PinnedTzRegistry
+from tripgraph.time.tz_registry import PinnedTzRegistry, resolve_local_to_utc, shift_utc_preserving_local_time
 from tripgraph.verifier.engine import VerificationReport, verify_trip_graph
 
 
@@ -77,17 +78,63 @@ class EditOutcome:
     payload: dict[str, Any]
 
 
-def apply_direct_mutation(graph: TripGraph, edit: EditCommand) -> TripGraph:
-    """Apply the user's direct structural edit before CP-SAT restores feasibility."""
+def _shift_leg_dst_safe(
+    leg,
+    stays_by_id: dict,
+    delta_days: int,
+    tz_registry: PinnedTzRegistry,
+):
+    """Shift a TransitLeg by delta_days preserving origin wall-clock departure and physical duration."""
+    origin_stay = stays_by_id[leg.from_stay_id]
+    dur_sec = leg.arrive_utc - leg.depart_utc
+    _, new_depart = shift_utc_preserving_local_time(
+        leg.depart_utc, origin_stay.tz_iana, delta_days, tz_registry
+    )
+    return leg.model_copy(
+        update={
+            "depart_utc": new_depart,
+            "arrive_utc": new_depart + dur_sec,
+        }
+    )
+
+
+def apply_direct_mutation(
+    graph: TripGraph,
+    edit: EditCommand,
+    tz_registry: PinnedTzRegistry | None = None,
+) -> TripGraph:
+    """Apply the user's direct structural edit using DST-safe timezone resolution."""
+    reg = tz_registry or PinnedTzRegistry()
+    stays_by_id = {s.id: s for s in graph.stays}
+
     if isinstance(edit, MoveActivityEdit):
+        target_stay = stays_by_id.get(edit.target_stay_id)
+        if target_stay is None:
+            raise ValueError(f"Unknown target_stay_id: {edit.target_stay_id!r}")
         new_acts = []
         for a in graph.activities:
             if a.id == edit.activity_id:
-                new_start = edit.target_start_utc if edit.target_start_utc is not None else a.start_utc
+                if edit.target_start_utc is not None:
+                    new_start = edit.target_start_utc
+                else:
+                    src_stay = stays_by_id[a.stay_id]
+                    src_tz = reg.get(src_stay.tz_iana)
+                    src_local = datetime.fromtimestamp(a.start_utc, tz=timezone.utc).astimezone(src_tz.tzinfo)
+                    dst_tz = reg.get(target_stay.tz_iana)
+                    resolved = resolve_local_to_utc(
+                        edit.target_local_date,
+                        dt_time(src_local.hour, src_local.minute, src_local.second),
+                        dst_tz,
+                        ambiguous_policy="fold_1" if src_local.fold == 1 else "fold_0",
+                        gap_policy="shift_forward",
+                    )
+                    assert resolved.utc_epoch is not None
+                    new_start = resolved.utc_epoch
                 new_acts.append(
                     a.model_copy(
                         update={
-                            "stay_id": edit.target_stay_id,
+                            "stay_id": target_stay.id,
+                            "city_id": target_stay.city_id,
                             "local_date": edit.target_local_date,
                             "start_utc": new_start,
                             "end_utc": new_start + a.duration_min * 60,
@@ -113,6 +160,21 @@ def apply_direct_mutation(graph: TripGraph, edit: EditCommand) -> TripGraph:
             }
         )
 
+    if isinstance(edit, LateNightArrivalEdit):
+        new_legs = tuple(
+            l.model_copy(
+                update={
+                    "depart_utc": edit.new_depart_utc,
+                    "arrive_utc": edit.new_arrive_utc,
+                    "carrier_slot_id": edit.new_carrier_slot_id,
+                }
+            )
+            if l.id == edit.leg_id
+            else l
+            for l in graph.transit_legs
+        )
+        return graph.model_copy(update={"transit_legs": new_legs})
+
     if isinstance(edit, UpdateDietaryEdit):
         return graph.model_copy(
             update={
@@ -126,24 +188,54 @@ def apply_direct_mutation(graph: TripGraph, edit: EditCommand) -> TripGraph:
         stays = list(graph.stays)
         idx = next(i for i, s in enumerate(stays) if s.id == edit.stay_id)
         target = stays[idx]
-        new_out = target.check_out_date + timedelta(days=edit.delta_nights)
+        delta = timedelta(days=edit.delta_nights)
+        new_out = target.check_out_date + delta
         stays[idx] = target.model_copy(
             update={"hotel": target.hotel.model_copy(update={"check_out_date": new_out})}
         )
-        # Shift downstream stays by delta_nights in calendar space
+        downstream_stay_ids: set[str] = set()
         for j in range(idx + 1, len(stays)):
             st = stays[j]
+            downstream_stay_ids.add(st.id)
             stays[j] = st.model_copy(
                 update={
                     "hotel": st.hotel.model_copy(
                         update={
-                            "check_in_date": st.check_in_date + timedelta(days=edit.delta_nights),
-                            "check_out_date": st.check_out_date + timedelta(days=edit.delta_nights),
+                            "check_in_date": st.check_in_date + delta,
+                            "check_out_date": st.check_out_date + delta,
                         }
                     )
                 }
             )
-        return graph.model_copy(update={"stays": tuple(stays)})
+
+        new_acts = []
+        for a in graph.activities:
+            if a.stay_id in downstream_stay_ids:
+                st = stays_by_id[a.stay_id]
+                new_date, new_start = shift_utc_preserving_local_time(
+                    a.start_utc, st.tz_iana, edit.delta_nights, reg
+                )
+                new_acts.append(
+                    a.model_copy(
+                        update={
+                            "local_date": new_date,
+                            "start_utc": new_start,
+                            "end_utc": new_start + a.duration_min * 60,
+                        }
+                    )
+                )
+            else:
+                new_acts.append(a)
+
+        new_legs = tuple(
+            _shift_leg_dst_safe(l, stays_by_id, edit.delta_nights, reg)
+            if (l.from_stay_id == target.id or l.from_stay_id in downstream_stay_ids or l.to_stay_id in downstream_stay_ids)
+            else l
+            for l in graph.transit_legs
+        )
+        return graph.model_copy(
+            update={"stays": tuple(stays), "activities": tuple(new_acts), "transit_legs": new_legs}
+        )
 
     if isinstance(edit, ShiftStartDateEdit):
         delta = timedelta(days=edit.delta_days)
@@ -160,17 +252,28 @@ def apply_direct_mutation(graph: TripGraph, edit: EditCommand) -> TripGraph:
             )
             for s in graph.stays
         )
-        new_acts = tuple(
-            a.model_copy(
-                update={
-                    "local_date": a.local_date + delta,
-                    "start_utc": a.start_utc + edit.delta_days * 86400,
-                    "end_utc": a.end_utc + edit.delta_days * 86400,
-                }
+        new_acts = []
+        for a in graph.activities:
+            st = stays_by_id[a.stay_id]
+            new_date, new_start = shift_utc_preserving_local_time(
+                a.start_utc, st.tz_iana, edit.delta_days, reg
             )
-            for a in graph.activities
+            new_acts.append(
+                a.model_copy(
+                    update={
+                        "local_date": new_date,
+                        "start_utc": new_start,
+                        "end_utc": new_start + a.duration_min * 60,
+                    }
+                )
+            )
+        new_legs = tuple(
+            _shift_leg_dst_safe(l, stays_by_id, edit.delta_days, reg)
+            for l in graph.transit_legs
         )
-        return graph.model_copy(update={"stays": new_stays, "activities": new_acts})
+        return graph.model_copy(
+            update={"stays": new_stays, "activities": tuple(new_acts), "transit_legs": new_legs}
+        )
 
     return graph
 
@@ -281,6 +384,27 @@ class TripOrchestrator:
             places = self.provider.all_places()
             holidays = {s.city_id: self.provider.get_public_holidays(s.city_id) for s in base_graph.stays}
 
+            # 0. Explicit locked-node refusal contract for ShiftStartDateEdit
+            if isinstance(edit, ShiftStartDateEdit) and not edit.allow_shift_locked:
+                locked_stays = [s.id for s in base_graph.stays if s.locked_by_user]
+                locked_legs = [l.id for l in base_graph.transit_legs if l.locked_by_user]
+                locked_acts = [a.id for a in base_graph.activities if a.locked_by_user]
+                if locked_stays or locked_legs or locked_acts:
+                    self.store.abort_request(request_id)
+                    return EditOutcome(
+                        409,
+                        {
+                            "status": "LOCKED_NODE_CONFLICT",
+                            "detail": (
+                                "ShiftStartDateEdit refused because user-locked nodes exist. "
+                                "Pass allow_shift_locked=true to explicitly calendar-shift locked nodes."
+                            ),
+                            "locked_stays": locked_stays,
+                            "locked_legs": locked_legs,
+                            "locked_activities": locked_acts,
+                        },
+                    )
+
             # 1. Compute Factor-Graph Dirty Closure
             closure = compute_dirty_closure(base_graph, edit, places)
 
@@ -292,7 +416,7 @@ class TripOrchestrator:
                     closure.dirty_leg_ids,
                     closure.dirty_activity_ids,
                 )
-                mutated = apply_direct_mutation(base_graph, edit)
+                mutated = apply_direct_mutation(base_graph, edit, self.tz_registry)
                 assert_lock_guard(snap, mutated)
                 rep = verify_trip_graph(
                     mutated, places, self.provider.transit_minutes, self.now_utc, self.tz_registry,
@@ -378,7 +502,7 @@ class TripOrchestrator:
                 closure.dirty_leg_ids,
                 closure.dirty_activity_ids,
             )
-            mutated = apply_direct_mutation(base_graph, edit)
+            mutated = apply_direct_mutation(base_graph, edit, self.tz_registry)
             ir = compile_dirty_ir(
                 mutated,
                 closure.dirty_days,
@@ -628,15 +752,21 @@ class TripOrchestrator:
             places = self.provider.all_places()
             holidays = {s.city_id: self.provider.get_public_holidays(s.city_id) for s in base_graph.stays}
 
-            # Capture SHA-256 FreezeSnapshot BEFORE mutation so every locked_by_user
-            # stay, transit leg, and activity is preserved across global replans.
-            snap = FreezeSnapshot.capture(
-                base_graph,
-                frozenset(s.id for s in base_graph.stays),
-                frozenset(l.id for l in base_graph.transit_legs),
-                frozenset(a.id for a in base_graph.activities),
+            mutated = apply_direct_mutation(base_graph, edit, self.tz_registry)
+            # Capture SHA-256 FreezeSnapshot for user-locked nodes.
+            # On ShiftStartDateEdit with explicit allow_shift_locked=True, lock hashes pin the
+            # approved calendar-shifted locked nodes so CP-SAT still cannot swap/drop/reschedule them.
+            lock_baseline = (
+                mutated
+                if (isinstance(edit, ShiftStartDateEdit) and edit.allow_shift_locked)
+                else base_graph
             )
-            mutated = apply_direct_mutation(base_graph, edit)
+            snap = FreezeSnapshot.capture(
+                lock_baseline,
+                frozenset(s.id for s in lock_baseline.stays),
+                frozenset(l.id for l in lock_baseline.transit_legs),
+                frozenset(a.id for a in lock_baseline.activities),
+            )
             all_days = frozenset((a.stay_id, a.local_date) for a in mutated.activities)
 
             job.events.append({"stage": "compiling_global_ir", "days": len(all_days)})

@@ -23,6 +23,10 @@ class ShiftStartDateEdit(BaseModel):
 
     edit_type: Literal["shift_start_date"] = "shift_start_date"
     delta_days: int
+    allow_shift_locked: bool = Field(
+        default=False,
+        description="Default False refuses shifting when any stay, leg, or activity is locked_by_user.",
+    )
 
 
 class SwapHotelEdit(BaseModel):

@@ -310,26 +310,34 @@ def compile_dirty_ir(
             if place is None:
                 continue
 
-            windows = extract_day_open_windows_min(place, act.local_date, epoch_origin_utc, tz_registry)
-            # Probe availability inside first valid window (or original slot if none) to get K3 status
-            if windows:
-                probe_s = epoch_origin_utc + windows[0][0] * 60
-                probe_e = probe_s + max(act.duration_min, 1) * 60
+            if place.city_id != act.city_id:
+                windows = ()
+                truth_val = TruthValue.FALSE
+                ep_code = "CROSS_CITY_PLACE_MISMATCH"
+                blocked_by_policy = False
+                authoritatively_closed = True
             else:
-                probe_s, probe_e = act.start_utc, max(act.end_utc, act.start_utc + 60)
+                windows = extract_day_open_windows_min(place, act.local_date, epoch_origin_utc, tz_registry)
+                # Probe availability inside first valid window (or original slot if none) to get K3 status
+                if windows:
+                    probe_s = epoch_origin_utc + windows[0][0] * 60
+                    probe_e = probe_s + max(act.duration_min, 1) * 60
+                else:
+                    probe_s, probe_e = act.start_utc, max(act.end_utc, act.start_utc + 60)
 
-            avail = resolve_place_availability(
-                place,
-                probe_s,
-                probe_e,
-                now_utc,
-                tz_registry,
-                public_holidays=city_holidays,
-            )
-
-            allowed = is_epistemic_allowed(avail.truth, avail.epistemic_code, verification_policy)
-            blocked_by_policy = (avail.truth == TruthValue.UNKNOWN) and (not allowed)
-            authoritatively_closed = avail.truth == TruthValue.FALSE
+                avail = resolve_place_availability(
+                    place,
+                    probe_s,
+                    probe_e,
+                    now_utc,
+                    tz_registry,
+                    public_holidays=city_holidays,
+                )
+                truth_val = avail.truth
+                ep_code = avail.epistemic_code
+                allowed = is_epistemic_allowed(truth_val, ep_code, verification_policy)
+                blocked_by_policy = (truth_val == TruthValue.UNKNOWN) and (not allowed)
+                authoritatively_closed = truth_val == TruthValue.FALSE
 
             cand_options.append(
                 CandidatePlaceOption(
@@ -339,8 +347,8 @@ def compile_dirty_ir(
                     tags=place.tags,
                     dietary_tags=place.dietary_tags,
                     windows_min=windows,
-                    truth=avail.truth,
-                    epistemic_code=avail.epistemic_code,
+                    truth=truth_val,
+                    epistemic_code=ep_code,
                     blocked_by_policy=blocked_by_policy,
                     authoritatively_closed=authoritatively_closed,
                     rank_penalty=rank_pen,
@@ -355,8 +363,8 @@ def compile_dirty_ir(
                     origin="VERIFICATION_POLICY_GATE",
                     kind="POLICY_GATE",
                     node_ids=(act.id,),
-                    detail=f"Candidate {pid} excluded under {verification_policy.value} ({avail.epistemic_code}).",
-                    epistemic_code=avail.epistemic_code,
+                    detail=f"Candidate {pid} excluded under {verification_policy.value} ({ep_code}).",
+                    epistemic_code=ep_code,
                 )
             elif authoritatively_closed:
                 gid = f"VENUE_CLOSED:{act.id}:{pid}"
@@ -365,8 +373,8 @@ def compile_dirty_ir(
                     origin="HARD_PHYSICAL_OR_CONTRACTUAL",
                     kind="VENUE_CLOSED",
                     node_ids=(act.id,),
-                    detail=f"Candidate {pid} is authoritatively closed ({avail.epistemic_code}).",
-                    epistemic_code=avail.epistemic_code,
+                    detail=f"Candidate {pid} is authoritatively closed ({ep_code}).",
+                    epistemic_code=ep_code,
                 )
             elif windows:
                 gid = f"OPENING_WINDOW:{act.id}:{pid}"

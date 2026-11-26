@@ -211,3 +211,30 @@ def resolve_local_to_utc(
 def utc_to_local(utc_epoch: int, pinned_tz: PinnedTimezone) -> datetime:
     """Convert an exact UTC epoch second to a timezone-aware local datetime."""
     return datetime.fromtimestamp(utc_epoch, tz=pinned_tz.tzinfo)
+
+
+def shift_utc_preserving_local_time(
+    utc_epoch: int,
+    tz_iana: str,
+    delta_days: int,
+    tz_registry: PinnedTzRegistry,
+) -> tuple[date, int]:
+    """Shift a UTC instant by delta_days while preserving local wall-clock time across DST.
+
+    Resolves the shifted (local_date, local_time) strictly via byte-pinned ZoneInfo
+    using PEP 495 fold preservation and shift_forward gap semantics.
+    """
+    pinned = tz_registry.get(tz_iana)
+    local_dt = datetime.fromtimestamp(utc_epoch, tz=timezone.utc).astimezone(pinned.tzinfo)
+    target_date = local_dt.date() + timedelta(days=delta_days)
+    wall_time = time(local_dt.hour, local_dt.minute, local_dt.second)
+    ambiguous_pol: AmbiguousPolicy = "fold_1" if local_dt.fold == 1 else "fold_0"
+    resolved = resolve_local_to_utc(
+        target_date,
+        wall_time,
+        pinned,
+        ambiguous_policy=ambiguous_pol,
+        gap_policy="shift_forward",
+    )
+    assert resolved.utc_epoch is not None
+    return target_date, resolved.utc_epoch

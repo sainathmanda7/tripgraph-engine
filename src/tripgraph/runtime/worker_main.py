@@ -100,12 +100,14 @@ def main(argv: list[str] | None = None) -> None:
     stdin_buf = sys.stdin.buffer
     stdout_buf = sys.stdout.buffer
 
-    # Signal parent supervisor immediately once PR_SET_PDEATHSIG + ppid check succeeded
-    # so SIGKILL respawn does not block callers during native OR-Tools import.
-    _send_frame(stdout_buf, {"ready": True, "pid": os.getpid()})
+    # Stage 1 handshake: confirm PR_SET_PDEATHSIG + ppid check succeeded (~40ms).
+    _send_frame(stdout_buf, {"stage": "pdeathsig_armed", "pid": os.getpid()})
 
     # Late import: OR-Tools only enters memory inside the already-protected child worker.
     from tripgraph.solver.cpsat_engine import solve_ir
+
+    # Stage 2 handshake: confirm native OR-Tools is loaded and worker is warm.
+    _send_frame(stdout_buf, {"stage": "ready", "pid": os.getpid()})
 
     while True:
         hdr = _read_exact(stdin_buf, _HEADER.size)

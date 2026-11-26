@@ -201,6 +201,8 @@ async def test_phase_b_executes_all_solves_via_supervisor_subprocess() -> None:
                 ),
             )
             assert out.http_status == expected_status, f"{label}: got {out}"
+            if label == "outage_preview":
+                assert out.payload.get("status") == "RETRYABLE_UPSTREAM_LLM_UNAVAILABLE", f"got {out}"
             assert solve_calls >= 2, f"{label}: expected >=2 supervisor solves, got {solve_calls}"
         finally:
             await sup.shutdown()
@@ -224,9 +226,41 @@ async def test_global_replan_blocks_locked_mutation_and_invalid_candidate() -> N
         base = _tokyo_trip("t_global_locked", lock_shrine=True)
         store.create_trip(base)
 
-        out = await orch.apply_edit(
+        # Default allow_shift_locked=False fails fast with 409 LOCKED_NODE_CONFLICT
+        out_refused = await orch.apply_edit(
             trip_id="t_global_locked",
             edit=ShiftStartDateEdit(delta_days=2),
+        )
+        assert out_refused.http_status == 409
+        assert out_refused.payload["status"] == "LOCKED_NODE_CONFLICT"
+        assert "a_mon_shrine" in out_refused.payload["locked_activities"]
+        saved = store.get_trip("t_global_locked")
+        assert saved is not None and saved.version == 1
+        shrine = next(a for a in saved.graph.activities if a.id == "a_mon_shrine")
+        assert shrine.local_date == D_MON
+
+        # Defense-in-depth: even with allow_shift_locked=True, if solver tampers with
+        # the locked shrine's venue/time, global LockGuard MUST block commit.
+        async def _tamper_locked_solve(ir, **kwargs) -> DualSolveResult:
+            return DualSolveResult(
+                certificate="PROVEN_OPTIMAL_IN_SCOPE",
+                assignments={
+                    "a_mon_shrine": SolvedActivityAssignment(
+                        act_id="a_mon_shrine",
+                        present=True,
+                        place_id="tyo_yoyogi_park",  # Illegal venue swap on locked node!
+                        start_utc=_tyo_utc(date(2026, 6, 17), 9, 0),
+                        end_utc=_tyo_utc(date(2026, 6, 17), 10, 30),
+                        changed=True,
+                    )
+                },
+                day_orders={},
+            )
+
+        sup.solve = _tamper_locked_solve  # type: ignore[method-assign]
+        out = await orch.apply_edit(
+            trip_id="t_global_locked",
+            edit=ShiftStartDateEdit(delta_days=2, allow_shift_locked=True),
         )
         assert out.http_status == 202
         job = orch.jobs[out.payload["job_id"]]
@@ -235,10 +269,8 @@ async def test_global_replan_blocks_locked_mutation_and_invalid_candidate() -> N
         assert job.status == "FAILED"
         assert job.final_payload is not None
         assert job.final_payload["error"] == "LOCK_GUARD_VIOLATION"
-        saved = store.get_trip("t_global_locked")
-        assert saved is not None and saved.version == 1
-        shrine = next(a for a in saved.graph.activities if a.id == "a_mon_shrine")
-        assert shrine.local_date == D_MON
+        saved_after = store.get_trip("t_global_locked")
+        assert saved_after is not None and saved_after.version == 1
     finally:
         await sup.shutdown()
         store.close()

@@ -36,6 +36,7 @@ class _WorkerHandle:
     worker_id: int
     proc: asyncio.subprocess.Process
     pgid: int
+    ready: bool = False
 
 
 class SolverProcessSupervisor:
@@ -68,7 +69,13 @@ class SolverProcessSupervisor:
             await self._idle.put(w)
         self._started = True
 
-    async def _spawn_worker(self) -> _WorkerHandle:
+    async def _read_frame(self, stdout: asyncio.StreamReader) -> dict:
+        hdr = await stdout.readexactly(_HEADER.size)
+        (frame_len,) = _HEADER.unpack(hdr)
+        frame_bytes = await stdout.readexactly(frame_len)
+        return pickle.loads(frame_bytes)
+
+    async def _spawn_worker(self, *, wait_for_ready: bool = True) -> _WorkerHandle:
         wid = self._next_id
         self._next_id += 1
         proc = await asyncio.create_subprocess_exec(
@@ -87,18 +94,21 @@ class SolverProcessSupervisor:
             pgid = os.getpgid(proc.pid)
         except ProcessLookupError:
             pgid = proc.pid
-        handle = _WorkerHandle(worker_id=wid, proc=proc, pgid=pgid)
+        handle = _WorkerHandle(worker_id=wid, proc=proc, pgid=pgid, ready=False)
         self._all_workers.add(handle)
 
-        # Wait for worker to arm PR_SET_PDEATHSIG and confirm readiness.
+        # Stage 1 (always): confirm PR_SET_PDEATHSIG + expected_ppid check succeeded.
+        # Stage 2 (when wait_for_ready=True): wait for native OR-Tools warm load.
         try:
             async with asyncio.timeout(15.0):
-                hdr = await proc.stdout.readexactly(_HEADER.size)
-                (ready_len,) = _HEADER.unpack(hdr)
-                ready_bytes = await proc.stdout.readexactly(ready_len)
-            ready_msg = pickle.loads(ready_bytes)
-            if not ready_msg.get("ready"):
-                raise RuntimeError(f"Worker {wid} unexpected startup frame: {ready_msg!r}")
+                armed_msg = await self._read_frame(proc.stdout)
+                if armed_msg.get("stage") != "pdeathsig_armed":
+                    raise RuntimeError(f"Worker {wid} unexpected stage-1 frame: {armed_msg!r}")
+                if wait_for_ready:
+                    ready_msg = await self._read_frame(proc.stdout)
+                    if ready_msg.get("stage") != "ready":
+                        raise RuntimeError(f"Worker {wid} unexpected stage-2 frame: {ready_msg!r}")
+                    handle.ready = True
         except Exception as exc:
             stderr_msg = ""
             if proc.stderr is not None:
@@ -200,6 +210,13 @@ class SolverProcessSupervisor:
 
             try:
                 async with asyncio.timeout(hard_deadline_sec):
+                    if not worker.ready:
+                        ready_msg = await self._read_frame(worker.proc.stdout)
+                        if ready_msg.get("stage") != "ready":
+                            raise RuntimeError(
+                                f"Worker {worker.worker_id} unexpected ready frame: {ready_msg!r}"
+                            )
+                        worker.ready = True
                     worker.proc.stdin.write(_HEADER.pack(len(payload)))
                     worker.proc.stdin.write(payload)
                     await worker.proc.stdin.drain()
@@ -232,5 +249,5 @@ class SolverProcessSupervisor:
                 else:
                     await self._kill_and_reap(worker)
                     if not self._closed:
-                        replacement = await self._spawn_worker()
+                        replacement = await self._spawn_worker(wait_for_ready=False)
                         await self._idle.put(replacement)
