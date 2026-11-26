@@ -2,37 +2,67 @@
 
 Security & Reliability Invariants:
 - Runs in its own process group (spawned with start_new_session=True).
-- Registers Linux PR_SET_PDEATHSIG(SIGKILL) so any master crash immediately
-  terminates this child process (zero orphaned CP-SAT workers).
+- Registers Linux PR_SET_PDEATHSIG(SIGKILL) BEFORE importing native OR-Tools,
+  verifies prctl() return value == 0, and re-checks os.getppid() == expected_ppid
+  to close the parent-exit race window.
 - Holds ZERO database connections or write credentials.
 - Communicates over binary 4-byte length-prefixed frames on stdin/stdout.
-  (Never prints text to stdout so binary framing stays 100% clean.)
 """
 
 from __future__ import annotations
 
+import argparse
 import ctypes
+import os
 import pickle
 import signal
 import struct
 import sys
 import time
-
-from tripgraph.solver.cpsat_engine import solve_ir
+from typing import Any, Callable
 
 _HEADER = struct.Struct("!I")
 _PR_SET_PDEATHSIG = 1
 
 
-def _install_linux_pdeathsig() -> None:
-    """Ask the Linux kernel to SIGKILL this worker if the parent process dies."""
-    if not sys.platform.startswith("linux"):
+def _install_linux_pdeathsig(
+    expected_ppid: int | None = None,
+    *,
+    _platform: str | None = None,
+    _libc: Any = None,
+    _getppid: Callable[[], int] = os.getppid,
+) -> None:
+    """Arm Linux PR_SET_PDEATHSIG(SIGKILL) and fail loudly on any registration error."""
+    plat = sys.platform if _platform is None else _platform
+    if not plat.startswith("linux"):
         return
-    try:
-        libc = ctypes.CDLL("libc.so.6")
-        libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
-    except OSError:
-        pass
+
+    if _libc is None:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl.argtypes = [
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        ]
+        libc.prctl.restype = ctypes.c_int
+    else:
+        libc = _libc
+
+    ret = int(libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0))
+    if ret != 0:
+        err = ctypes.get_errno()
+        raise RuntimeError(
+            f"prctl(PR_SET_PDEATHSIG, SIGKILL) failed with ret={ret}, errno={err}"
+        )
+
+    actual_ppid = _getppid()
+    if expected_ppid is not None and actual_ppid != expected_ppid:
+        raise RuntimeError(
+            f"Parent process exited before PR_SET_PDEATHSIG armed "
+            f"(expected_ppid={expected_ppid}, actual_ppid={actual_ppid})"
+        )
 
 
 def _read_exact(stream, n: int) -> bytes | None:
@@ -54,15 +84,32 @@ def _send_frame(stream, obj: object) -> None:
     stream.flush()
 
 
-def main() -> None:
-    _install_linux_pdeathsig()
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--expected-ppid", type=int, default=None)
+    args, _ = parser.parse_known_args(argv)
+
+    # CRITICAL: Arm parent-death protection BEFORE importing native OR-Tools.
+    try:
+        _install_linux_pdeathsig(expected_ppid=args.expected_ppid)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"worker_main fatal pdeathsig error: {exc}\n")
+        sys.stderr.flush()
+        sys.exit(2)
+
     stdin_buf = sys.stdin.buffer
     stdout_buf = sys.stdout.buffer
+
+    # Signal parent supervisor immediately once PR_SET_PDEATHSIG + ppid check succeeded
+    # so SIGKILL respawn does not block callers during native OR-Tools import.
+    _send_frame(stdout_buf, {"ready": True, "pid": os.getpid()})
+
+    # Late import: OR-Tools only enters memory inside the already-protected child worker.
+    from tripgraph.solver.cpsat_engine import solve_ir
 
     while True:
         hdr = _read_exact(stdin_buf, _HEADER.size)
         if hdr is None:
-            # Parent closed pipe (clean shutdown or crash) -> exit immediately
             break
         (length,) = _HEADER.unpack(hdr)
         payload_bytes = _read_exact(stdin_buf, length)
@@ -71,7 +118,6 @@ def main() -> None:
 
         try:
             req = pickle.loads(payload_bytes)
-            # Test-only hook to simulate a hung C++ solver and verify SIGKILL recovery
             hang_sec = float(req.get("test_hang_sec", 0.0))
             if hang_sec > 0.0:
                 time.sleep(hang_sec)

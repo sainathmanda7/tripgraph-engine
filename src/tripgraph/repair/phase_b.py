@@ -16,10 +16,11 @@ Consent-Gated Outage Safety:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import date
 import json
-from typing import Literal, Protocol
+from typing import Awaitable, Literal, Protocol
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -35,8 +36,8 @@ from tripgraph.schema.models import (
     TripGraph,
     VerificationPolicy,
 )
-from tripgraph.solver.cpsat_engine import DualSolveResult, solve_ir
-from tripgraph.solver.ir import AssumptionGroupSpec, compile_dirty_ir
+from tripgraph.solver.ir import AssumptionGroupSpec, CompiledConstraintIR, compile_dirty_ir
+from tripgraph.solver.types import DualSolveResult
 from tripgraph.time.tz_registry import PinnedTzRegistry
 
 
@@ -73,6 +74,16 @@ class LLMCallMetrics:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     latency_ms: float = 0.0
+
+
+class AsyncIRSolver(Protocol):
+    def __call__(
+        self,
+        ir: CompiledConstraintIR,
+        *,
+        opt_timeout_sec: float,
+        run_mus: bool = False,
+    ) -> Awaitable[DualSolveResult]: ...
 
 
 class PhaseBLLMClient(Protocol):
@@ -119,7 +130,7 @@ class PhaseBResult:
     completion_tokens: int = 0
 
 
-def run_phase_b_cycle(
+async def run_phase_b_cycle(
     *,
     graph: TripGraph,
     dirty_days: frozenset[tuple[str, date]],
@@ -130,6 +141,7 @@ def run_phase_b_cycle(
     now_utc: int,
     tz_registry: PinnedTzRegistry,
     llm_client: PhaseBLLMClient,
+    solve_fn: AsyncIRSolver,
     verification_policy: VerificationPolicy = VerificationPolicy.ASSUME_WEEKLY_NON_HOLIDAY,
     public_holidays_by_city: dict[str, frozenset[date]] | None = None,
     allow_auto_drop_optional: bool = False,
@@ -141,7 +153,8 @@ def run_phase_b_cycle(
 
     # --- Step (1): LLM SearchIntent (cap 1400ms) ---
     try:
-        intent_out, m1 = llm_client.generate_search_intent(
+        intent_out, m1 = await asyncio.to_thread(
+            llm_client.generate_search_intent,
             target_act=target_act,
             core_groups=initial_core,
             user_intent_notes=graph.user_intent_notes,
@@ -151,13 +164,14 @@ def run_phase_b_cycle(
         prompt_toks += m1.prompt_tokens
         comp_toks += m1.completion_tokens
     except LLMOutageError:
-        return _handle_llm_outage(
+        return await _handle_llm_outage(
             graph=graph,
             dirty_days=dirty_days,
             place_registry=place_registry,
             proxy=proxy,
             now_utc=now_utc,
             tz_registry=tz_registry,
+            solve_fn=solve_fn,
             verification_policy=verification_policy,
             public_holidays_by_city=public_holidays_by_city,
             allow_auto_drop_optional=allow_auto_drop_optional,
@@ -181,7 +195,7 @@ def run_phase_b_cycle(
         near_lat=orig_place.lat if orig_place else None,
         near_lon=orig_place.lon if orig_place else None,
     )
-    fetched: list[GroundedRecord[Place]] = proxy.search_candidates(search_intent)
+    fetched: list[GroundedRecord[Place]] = await asyncio.to_thread(proxy.search_candidates, search_intent)
     if not fetched:
         return PhaseBResult(
             status="NEEDS_USER_RESOLUTION",
@@ -205,7 +219,8 @@ def run_phase_b_cycle(
 
     # --- Step (3): LLM SemanticRank (strict grounded whitelist <= 5) ---
     try:
-        rank_out, m2 = llm_client.rank_candidates(
+        rank_out, m2 = await asyncio.to_thread(
+            llm_client.rank_candidates,
             target_act=target_act,
             candidates=list(fetched_map.values()),
             user_intent_notes=graph.user_intent_notes,
@@ -216,13 +231,14 @@ def run_phase_b_cycle(
         prompt_toks += m2.prompt_tokens
         comp_toks += m2.completion_tokens
     except LLMOutageError:
-        return _handle_llm_outage(
+        return await _handle_llm_outage(
             graph=graph,
             dirty_days=dirty_days,
             place_registry=merged_registry,
             proxy=proxy,
             now_utc=now_utc,
             tz_registry=tz_registry,
+            solve_fn=solve_fn,
             verification_policy=verification_policy,
             public_holidays_by_city=public_holidays_by_city,
             allow_auto_drop_optional=allow_auto_drop_optional,
@@ -259,7 +275,7 @@ def run_phase_b_cycle(
             public_holidays_by_city=public_holidays_by_city,
             allow_auto_drop_optional=False,
         )
-        res_top = solve_ir(ir_top, opt_timeout_sec=0.65, run_mus=False)
+        res_top = await solve_fn(ir_top, opt_timeout_sec=0.65, run_mus=False)
         if res_top.certificate in ("PROVEN_OPTIMAL_IN_SCOPE", "FEASIBLE_OPTIMALITY_UNPROVEN"):
             return PhaseBResult(
                 status="SOLVED_BY_PHASE_B",
@@ -287,7 +303,7 @@ def run_phase_b_cycle(
             public_holidays_by_city=public_holidays_by_city,
             allow_auto_drop_optional=False,
         )
-        res_fb = solve_ir(ir_fb, opt_timeout_sec=0.45, run_mus=False)
+        res_fb = await solve_fn(ir_fb, opt_timeout_sec=0.45, run_mus=False)
         if res_fb.certificate in ("PROVEN_OPTIMAL_IN_SCOPE", "FEASIBLE_OPTIMALITY_UNPROVEN"):
             return PhaseBResult(
                 status="SOLVED_BY_POOL_FALLBACK",
@@ -311,7 +327,7 @@ def run_phase_b_cycle(
     )
 
 
-def _handle_llm_outage(
+async def _handle_llm_outage(
     *,
     graph: TripGraph,
     dirty_days: frozenset[tuple[str, date]],
@@ -319,6 +335,7 @@ def _handle_llm_outage(
     proxy: BudgetedProviderProxy,
     now_utc: int,
     tz_registry: PinnedTzRegistry,
+    solve_fn: AsyncIRSolver,
     verification_policy: VerificationPolicy,
     public_holidays_by_city: dict[str, frozenset[date]] | None,
     allow_auto_drop_optional: bool,
@@ -338,7 +355,7 @@ def _handle_llm_outage(
         public_holidays_by_city=public_holidays_by_city,
         allow_auto_drop_optional=True,
     )
-    drop_res = solve_ir(ir_drop, opt_timeout_sec=0.45, run_mus=False)
+    drop_res = await solve_fn(ir_drop, opt_timeout_sec=0.45, run_mus=False)
     drop_feasible = drop_res.certificate in (
         "PROVEN_OPTIMAL_IN_SCOPE",
         "FEASIBLE_OPTIMALITY_UNPROVEN",

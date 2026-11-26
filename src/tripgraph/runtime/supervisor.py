@@ -17,7 +17,7 @@ import struct
 import sys
 from dataclasses import dataclass
 
-from tripgraph.solver.cpsat_engine import DualSolveResult
+from tripgraph.solver.types import DualSolveResult
 from tripgraph.solver.ir import CompiledConstraintIR
 
 _HEADER = struct.Struct("!I")
@@ -75,18 +75,44 @@ class SolverProcessSupervisor:
             sys.executable,
             "-m",
             "tripgraph.runtime.worker_main",
+            "--expected-ppid",
+            str(os.getpid()),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,  # Own process group for atomic SIGKILL
         )
-        assert proc.pid is not None
+        assert proc.pid is not None and proc.stdout is not None
         try:
             pgid = os.getpgid(proc.pid)
         except ProcessLookupError:
             pgid = proc.pid
         handle = _WorkerHandle(worker_id=wid, proc=proc, pgid=pgid)
         self._all_workers.add(handle)
+
+        # Wait for worker to arm PR_SET_PDEATHSIG and confirm readiness.
+        try:
+            async with asyncio.timeout(15.0):
+                hdr = await proc.stdout.readexactly(_HEADER.size)
+                (ready_len,) = _HEADER.unpack(hdr)
+                ready_bytes = await proc.stdout.readexactly(ready_len)
+            ready_msg = pickle.loads(ready_bytes)
+            if not ready_msg.get("ready"):
+                raise RuntimeError(f"Worker {wid} unexpected startup frame: {ready_msg!r}")
+        except Exception as exc:
+            stderr_msg = ""
+            if proc.stderr is not None:
+                try:
+                    stderr_bytes = await asyncio.wait_for(proc.stderr.read(), timeout=0.5)
+                    stderr_msg = stderr_bytes.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+            await self._kill_and_reap(handle)
+            raise RuntimeError(
+                f"Worker {wid} failed startup handshake: {exc}"
+                + (f" | stderr: {stderr_msg}" if stderr_msg else "")
+            ) from exc
+
         return handle
 
     async def _kill_and_reap(self, handle: _WorkerHandle) -> None:

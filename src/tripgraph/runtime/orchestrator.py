@@ -10,7 +10,7 @@ import uuid
 from typing import Any, Literal
 
 from tripgraph.graph.closure import compute_dirty_closure
-from tripgraph.graph.freeze import FreezeSnapshot, assert_lock_guard, compute_blast_radius
+from tripgraph.graph.freeze import FreezeSnapshot, LockViolationError, assert_lock_guard, compute_blast_radius
 from tripgraph.grounding.fixtures import DEFAULT_FIXTURE_NOW_UTC
 from tripgraph.grounding.provider import BudgetedProviderProxy, GroundingProvider
 from tripgraph.repair.phase_b import PhaseBLLMClient, run_phase_b_cycle
@@ -36,8 +36,8 @@ from tripgraph.schema.models import (
     TruthValue,
     VerificationPolicy,
 )
-from tripgraph.solver.cpsat_engine import DualSolveResult
-from tripgraph.solver.ir import compile_dirty_ir
+from tripgraph.solver.types import DualSolveResult
+from tripgraph.solver.ir import compile_dirty_ir, is_epistemic_allowed
 from tripgraph.time.tz_registry import PinnedTzRegistry
 from tripgraph.verifier.engine import VerificationReport, verify_trip_graph
 
@@ -238,6 +238,24 @@ class TripOrchestrator:
             public_holidays_by_city=holidays,
         )
 
+    @staticmethod
+    def _check_verification_commit_gate(
+        rep, verification_policy: VerificationPolicy
+    ) -> tuple[bool, list[str], list[str]]:
+        """Enforce single-source-of-truth K3 + VerificationPolicy commit gate.
+
+        Blocks any FALSE violation and any UNKNOWN assumption disallowed under
+        `verification_policy` via `is_epistemic_allowed`.
+        """
+        violations = [v.code for v in rep.violations]
+        disallowed_unknowns = [
+            a.code
+            for a in rep.assumptions_accepted
+            if not is_epistemic_allowed(a.truth, a.code, verification_policy)
+        ]
+        blocked = (rep.hard_constraints_status == TruthValue.FALSE) or bool(disallowed_unknowns)
+        return blocked, violations, disallowed_unknowns
+
     async def apply_edit(
         self,
         *,
@@ -266,23 +284,35 @@ class TripOrchestrator:
             # 1. Compute Factor-Graph Dirty Closure
             closure = compute_dirty_closure(base_graph, edit, places)
 
-            # 2. All-locked fast path (no divide-by-zero, verify only)
+            # 2. All-locked fast path (no divide-by-zero; enforce LockGuard + K3/policy gate, no CP-SAT solve)
             if closure.scope_tier == "ALL_LOCKED_VERIFY_ONLY":
+                snap = FreezeSnapshot.capture(
+                    base_graph,
+                    closure.dirty_stay_ids,
+                    closure.dirty_leg_ids,
+                    closure.dirty_activity_ids,
+                )
                 mutated = apply_direct_mutation(base_graph, edit)
+                assert_lock_guard(snap, mutated)
                 rep = verify_trip_graph(
                     mutated, places, self.provider.transit_minutes, self.now_utc, self.tz_registry,
                     public_holidays_by_city=holidays,
                 )
-                if rep.hard_constraints_status == TruthValue.FALSE:
+                blocked, violations, disallowed_unknowns = self._check_verification_commit_gate(
+                    rep, verification_policy
+                )
+                if blocked:
                     self.store.abort_request(request_id)
                     return EditOutcome(
                         409,
                         {
                             "status": "NEEDS_USER_RESOLUTION",
                             "scope_tier": "ALL_LOCKED_VERIFY_ONLY",
-                            "solver_certificate": "PROVEN_PHYSICALLY_INFEASIBLE",
+                            "solver_certificate": "NOT_INVOKED_VERIFY_ONLY",
+                            "hard_constraints_status": rep.hard_constraints_status.value,
                             "verification_certificate": rep.verification_certificate,
-                            "violations": [v.code for v in rep.violations],
+                            "violations": violations,
+                            "disallowed_assumptions": disallowed_unknowns,
                         },
                     )
                 saved = self.store.commit_fenced(
@@ -294,9 +324,13 @@ class TripOrchestrator:
                         "status": "COMMITTED",
                         "version": saved.version,
                         "scope_tier": "ALL_LOCKED_VERIFY_ONLY",
-                        "solver_certificate": "PROVEN_OPTIMAL_IN_SCOPE",
+                        "solver_certificate": "NOT_INVOKED_VERIFY_ONLY",
                         "hard_constraints_status": rep.hard_constraints_status.value,
                         "verification_certificate": rep.verification_certificate,
+                        "assumptions_accepted": [
+                            {"node_ids": list(a.node_ids), "code": a.code}
+                            for a in rep.assumptions_accepted
+                        ],
                         "graph": saved.graph.model_dump(mode="json"),
                     },
                 )
@@ -384,8 +418,18 @@ class TripOrchestrator:
                     if target_act is not None:
                         proxy = BudgetedProviderProxy(self.provider)
                         if self.llm_client is not None:
-                            pb = await asyncio.to_thread(
-                                run_phase_b_cycle,
+                            async def _phase_b_solve(
+                                pb_ir, *, opt_timeout_sec: float, run_mus: bool = False
+                            ) -> DualSolveResult:
+                                cap = ctx.stage_cap_sec(max(opt_timeout_sec * 1000.0 + 150.0, 450.0))
+                                return await self.supervisor.solve(
+                                    pb_ir,
+                                    hard_deadline_sec=cap,
+                                    opt_timeout_sec=min(opt_timeout_sec, max(0.05, cap - 0.10)),
+                                    run_mus=run_mus,
+                                )
+
+                            pb = await run_phase_b_cycle(
                                 graph=mutated,
                                 dirty_days=closure.dirty_days,
                                 target_act=target_act,
@@ -395,6 +439,7 @@ class TripOrchestrator:
                                 now_utc=self.now_utc,
                                 tz_registry=self.tz_registry,
                                 llm_client=self.llm_client,
+                                solve_fn=_phase_b_solve,
                                 verification_policy=verification_policy,
                                 public_holidays_by_city=holidays,
                                 allow_auto_drop_optional=allow_auto_drop_optional,
@@ -504,13 +549,18 @@ class TripOrchestrator:
                 self.tz_registry,
                 public_holidays_by_city=holidays,
             )
-            if rep.hard_constraints_status == TruthValue.FALSE:
+            blocked, violations, disallowed_unknowns = self._check_verification_commit_gate(
+                rep, verification_policy
+            )
+            if blocked:
                 self.store.abort_request(request_id)
                 return EditOutcome(
                     500,
                     {
                         "error": "INDEPENDENT_VERIFIER_REJECTED_SOLVED_GRAPH",
-                        "violations": [v.code for v in rep.violations],
+                        "hard_constraints_status": rep.hard_constraints_status.value,
+                        "violations": violations,
+                        "disallowed_assumptions": disallowed_unknowns,
                     },
                 )
 
@@ -548,6 +598,9 @@ class TripOrchestrator:
                 },
             )
 
+        except LockViolationError as exc:
+            self.store.abort_request(request_id)
+            return EditOutcome(409, {"status": "LOCK_GUARD_VIOLATION", "detail": str(exc)})
         except SolverOverloadedError as exc:
             self.store.abort_request(request_id)
             return EditOutcome(503, {"status": "SOLVER_OVERLOADED", "detail": str(exc)})
@@ -574,6 +627,15 @@ class TripOrchestrator:
         try:
             places = self.provider.all_places()
             holidays = {s.city_id: self.provider.get_public_holidays(s.city_id) for s in base_graph.stays}
+
+            # Capture SHA-256 FreezeSnapshot BEFORE mutation so every locked_by_user
+            # stay, transit leg, and activity is preserved across global replans.
+            snap = FreezeSnapshot.capture(
+                base_graph,
+                frozenset(s.id for s in base_graph.stays),
+                frozenset(l.id for l in base_graph.transit_legs),
+                frozenset(a.id for a in base_graph.activities),
+            )
             mutated = apply_direct_mutation(base_graph, edit)
             all_days = frozenset((a.stay_id, a.local_date) for a in mutated.activities)
 
@@ -605,6 +667,47 @@ class TripOrchestrator:
                 return
 
             candidate = _apply_solve_assignments(mutated, res, places)
+
+            # Mandatory pre-commit safety barrier: LockGuard + independent K3/policy verification.
+            try:
+                assert_lock_guard(snap, candidate)
+            except LockViolationError as exc:
+                self.store.abort_request(job.request_id)
+                job.status = "FAILED"
+                job.final_payload = {"error": "LOCK_GUARD_VIOLATION", "detail": str(exc)}
+                job.events.append({"stage": "failed", "error": "LOCK_GUARD_VIOLATION", "detail": str(exc)})
+                return
+
+            rep = verify_trip_graph(
+                candidate,
+                places,
+                self.provider.transit_minutes,
+                self.now_utc,
+                self.tz_registry,
+                public_holidays_by_city=holidays,
+            )
+            blocked, violations, disallowed_unknowns = self._check_verification_commit_gate(
+                rep, verification_policy
+            )
+            if blocked:
+                self.store.abort_request(job.request_id)
+                job.status = "FAILED"
+                job.final_payload = {
+                    "error": "INDEPENDENT_VERIFIER_REJECTED_SOLVED_GRAPH",
+                    "hard_constraints_status": rep.hard_constraints_status.value,
+                    "violations": violations,
+                    "disallowed_assumptions": disallowed_unknowns,
+                }
+                job.events.append(
+                    {
+                        "stage": "failed",
+                        "error": "INDEPENDENT_VERIFIER_REJECTED_SOLVED_GRAPH",
+                        "violations": violations,
+                        "disallowed_assumptions": disallowed_unknowns,
+                    }
+                )
+                return
+
             saved = self.store.commit_fenced(
                 trip_id=job.trip_id,
                 base_version=job.base_version,
@@ -617,8 +720,20 @@ class TripOrchestrator:
                 "scope_tier": "GLOBAL_REPLAN",
                 "version": saved.version,
                 "solver_certificate": res.certificate,
+                "hard_constraints_status": rep.hard_constraints_status.value,
+                "verification_certificate": rep.verification_certificate,
+                "assumptions_accepted": [
+                    {"node_ids": list(a.node_ids), "code": a.code}
+                    for a in rep.assumptions_accepted
+                ],
             }
-            job.events.append({"stage": "completed", "version": saved.version})
+            job.events.append(
+                {
+                    "stage": "completed",
+                    "version": saved.version,
+                    "verification_certificate": rep.verification_certificate,
+                }
+            )
         except Exception as exc:  # noqa: BLE001
             self.store.abort_request(job.request_id)
             job.status = "FAILED"

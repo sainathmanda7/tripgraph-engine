@@ -227,7 +227,12 @@ def test_s2_greedy_trapped_by_locked_window_while_cpsat_solves_globally() -> Non
     assert cpsat_res.day_orders[("s_tyo", D_MON.isoformat())] == ("act_lock", "act_flex")
 
 
-def test_phase_b_filters_hallucinations_avoids_crowded_venues_and_proves_via_cpsat() -> None:
+async def _unit_async_solve(ir, *, opt_timeout_sec: float, run_mus: bool = False):
+    return solve_ir(ir, opt_timeout_sec=opt_timeout_sec, run_mus=run_mus)
+
+
+@pytest.mark.asyncio
+async def test_phase_b_filters_hallucinations_avoids_crowded_venues_and_proves_via_cpsat() -> None:
     reg = PinnedTzRegistry()
     graph, provider = _tokyo_monday_closed_trip()
     places = provider.all_places()
@@ -238,7 +243,7 @@ def test_phase_b_filters_hallucinations_avoids_crowded_venues_and_proves_via_cps
     res_a = solve_ir(ir_a)
 
     proxy = BudgetedProviderProxy(provider)
-    pb_res = run_phase_b_cycle(
+    pb_res = await run_phase_b_cycle(
         graph=graph,
         dirty_days=dirty_days,
         target_act=target_act,
@@ -248,6 +253,7 @@ def test_phase_b_filters_hallucinations_avoids_crowded_venues_and_proves_via_cps
         now_utc=DEFAULT_FIXTURE_NOW_UTC,
         tz_registry=reg,
         llm_client=_FakePhaseBClient(include_hallucination=True),
+        solve_fn=_unit_async_solve,
     )
 
     assert pb_res.status == "SOLVED_BY_PHASE_B"
@@ -261,7 +267,8 @@ def test_phase_b_filters_hallucinations_avoids_crowded_venues_and_proves_via_cps
     assert chosen in ("tyo_2121_design", "tyo_mingeikan")
 
 
-def test_consent_gated_llm_outage_never_silently_drops_user_activity() -> None:
+@pytest.mark.asyncio
+async def test_consent_gated_llm_outage_never_silently_drops_user_activity() -> None:
     reg = PinnedTzRegistry()
     graph, provider = _tokyo_monday_closed_trip()
     places = provider.all_places()
@@ -270,10 +277,11 @@ def test_consent_gated_llm_outage_never_silently_drops_user_activity() -> None:
 
     # Default allow_auto_drop_optional=False -> MUST NOT commit drop!
     proxy1 = BudgetedProviderProxy(provider)
-    res_default = run_phase_b_cycle(
+    res_default = await run_phase_b_cycle(
         graph=graph, dirty_days=dirty_days, target_act=target_act, initial_core=(),
         proxy=proxy1, place_registry=places, now_utc=DEFAULT_FIXTURE_NOW_UTC, tz_registry=reg,
         llm_client=_FakePhaseBClient(fail_outage=True),
+        solve_fn=_unit_async_solve,
         allow_auto_drop_optional=False,
     )
     assert res_default.status == "RETRYABLE_UPSTREAM_LLM_UNAVAILABLE"
@@ -283,10 +291,11 @@ def test_consent_gated_llm_outage_never_silently_drops_user_activity() -> None:
 
     # Explicit opt-in allow_auto_drop_optional=True -> commits DEGRADED_OPTIONAL_DROPPED
     proxy2 = BudgetedProviderProxy(provider)
-    res_optin = run_phase_b_cycle(
+    res_optin = await run_phase_b_cycle(
         graph=graph, dirty_days=dirty_days, target_act=target_act, initial_core=(),
         proxy=proxy2, place_registry=places, now_utc=DEFAULT_FIXTURE_NOW_UTC, tz_registry=reg,
         llm_client=_FakePhaseBClient(fail_outage=True),
+        solve_fn=_unit_async_solve,
         allow_auto_drop_optional=True,
     )
     assert res_optin.status == "DEGRADED_OPTIONAL_DROPPED"
